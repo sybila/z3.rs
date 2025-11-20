@@ -281,6 +281,22 @@ impl Optimize {
             )
         }
     }
+
+    /// Retrieve lower bound value or approximation for the i-th optimization objective.
+    pub fn get_lower(&self, objective_id: u32) -> Option<Dynamic> {
+        unsafe {
+            Z3_optimize_get_lower(self.ctx.z3_ctx.0, self.z3_opt, objective_id)
+                .map(|ast| Dynamic::wrap(&self.ctx, ast))
+        }
+    }
+
+    /// Retrieve upper bound value or approximation for the i-th optimization objective.
+    pub fn get_upper(&self, objective_id: u32) -> Option<Dynamic> {
+        unsafe {
+            Z3_optimize_get_upper(self.ctx.z3_ctx.0, self.z3_opt, objective_id)
+                .map(|ast| Dynamic::wrap(&self.ctx, ast))
+        }
+    }
 }
 
 impl Default for Optimize {
