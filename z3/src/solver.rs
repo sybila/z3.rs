@@ -13,6 +13,10 @@ use crate::{
 use std::ops::AddAssign;
 
 impl Solver {
+    pub fn get_z3_solver(&self) -> Z3_solver {
+        self.z3_slv
+    }
+
     pub(crate) unsafe fn wrap(ctx: &Context, z3_slv: Z3_solver) -> Solver {
         unsafe {
             Z3_solver_inc_ref(ctx.z3_ctx.0, z3_slv);
