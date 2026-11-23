@@ -12,6 +12,27 @@ use crate::{
 };
 use std::ops::AddAssign;
 
+/// The state of the phase-bias user propagator (see [`Solver::set_phase_bias`]): the preferred
+/// phase of each atom, by AST id (the atoms are kept alive).
+#[cfg(feature = "z3_4_16")]
+struct PhaseBias {
+    z3_ctx: Z3_context,
+    atoms: std::collections::BTreeMap<std::ffi::c_uint, (Bool, bool)>,
+}
+
+/// Owns a [`PhaseBias`] that Z3 points to, and frees it on drop. A raw pointer, not a `Box`:
+/// moving a `Box` (with the solver) would assert unique access while Z3 holds the pointer.
+#[cfg(feature = "z3_4_16")]
+pub(crate) struct OwnedPhaseBias(std::ptr::NonNull<PhaseBias>);
+
+#[cfg(feature = "z3_4_16")]
+impl Drop for OwnedPhaseBias {
+    fn drop(&mut self) {
+        // SAFETY: the pointer comes from `Box::leak` and is owned only by `self`.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
 impl Solver {
     pub fn get_z3_solver(&self) -> Z3_solver {
         self.z3_slv
@@ -24,6 +45,8 @@ impl Solver {
         Solver {
             ctx: ctx.clone(),
             z3_slv,
+            #[cfg(feature = "z3_4_16")]
+            propagator: Default::default(),
         }
     }
 
@@ -102,6 +125,117 @@ impl Solver {
         let ast = ast.borrow();
         debug!("assert: {ast:?}");
         unsafe { Z3_solver_assert(self.ctx.z3_ctx.0, self.z3_slv, ast.z3_ast) };
+    }
+
+    /// Give the solver a hint that `var` should take `value`. For a Boolean `var`, this sets its
+    /// initial phase. It is a heuristic only and never changes the result of a check.
+    ///
+    /// A Boolean `var` that Z3 never assigns (it does not matter for the assertions) gets no value
+    /// from the hint; its value in the model depends on model completion.
+    ///
+    /// Only Z3's incremental solver uses the hint. Until the solver is used incrementally (see
+    /// [`Solver::new()`]), checks run the non-incremental one, which ignores it, unless the
+    /// parameter `ignore_solver1` is set or the solver has a user propagator (see
+    /// [`Solver::set_phase_bias()`]).
+    ///
+    /// `var` and `value` must have the same sort.
+    // Behind the `z3_4_16` feature: the Z3 function it uses is newer than the minimum
+    // supported Z3 version.
+    #[cfg(feature = "z3_4_16")]
+    pub fn set_initial_value<T: Ast>(&self, var: &T, value: &T) {
+        unsafe {
+            Z3_solver_set_initial_value(
+                self.ctx.z3_ctx.0,
+                self.z3_slv,
+                var.get_z3_ast(),
+                value.get_z3_ast(),
+            )
+        };
+    }
+
+    /// Make the solver prefer the given phase of each atom whenever it decides one, through a
+    /// user propagator. It is a heuristic only and never changes the result of a check. For an
+    /// atom listed more than once, the last phase applies. It applies from the first check, since
+    /// a user propagator makes Z3 use its incremental solver.
+    ///
+    /// An atom that Z3 never decides (it does not matter for the assertions) is not biased; its
+    /// value in the model depends on model completion.
+    ///
+    /// A clone of the solver is not biased.
+    ///
+    /// # Panics
+    ///
+    /// If the solver already has a user propagator: it was biased before, or it is a clone of a
+    /// biased solver (Z3 crashes on a second propagator).
+    // Behind the `z3_4_16` feature: the Z3 functions it uses are newer than the minimum
+    // supported Z3 version.
+    #[cfg(feature = "z3_4_16")]
+    pub fn set_phase_bias(&self, atoms: &[(Bool, bool)]) {
+        use std::ffi::{c_uint, c_void};
+
+        if self.propagator.get().is_some() {
+            panic!("The solver already has a user propagator.");
+        }
+
+        // Called at every backtracking point; the bias has no search state to save or restore.
+        unsafe extern "C" fn push(_: *mut c_void, _: Z3_solver_callback) {}
+        unsafe extern "C" fn pop(_: *mut c_void, _: Z3_solver_callback, _: c_uint) {}
+        // Called when Z3 copies the solver (e.g. by `translate`); null gives the copy no bias.
+        unsafe extern "C" fn fresh(_: *mut c_void, _: Z3_context) -> *mut c_void {
+            std::ptr::null_mut()
+        }
+        // Called when Z3 decides an atom; a registered one gets its preferred phase instead.
+        unsafe extern "C" fn decide(
+            ctx: *mut c_void,
+            cb: Z3_solver_callback,
+            t: Z3_ast,
+            idx: c_uint,
+            phase: bool,
+        ) {
+            if ctx.is_null() {
+                return;
+            }
+            let bias = unsafe { &*(ctx as *const PhaseBias) };
+            let id = unsafe { Z3_get_ast_id(bias.z3_ctx, t) };
+            if let Some(&(_, preferred)) = bias.atoms.get(&id)
+                && preferred != phase
+            {
+                let preferred = if preferred { Z3_L_TRUE } else { Z3_L_FALSE };
+                unsafe { Z3_solver_next_split(bias.z3_ctx, cb, t, idx, preferred) };
+            }
+        }
+
+        let z3_ctx = self.ctx.z3_ctx.0;
+        let bias = Box::leak(Box::new(PhaseBias {
+            z3_ctx,
+            atoms: atoms
+                .iter()
+                .map(|(atom, phase)| {
+                    let id = unsafe { Z3_get_ast_id(z3_ctx, atom.z3_ast) };
+                    (id, (atom.clone(), *phase))
+                })
+                .collect(),
+        }));
+
+        // `self` owns the state, and `Drop for Solver` releases Z3's solver before the fields
+        // drop, so Z3 never calls back into a freed state.
+        let bias = OwnedPhaseBias(std::ptr::NonNull::from(bias));
+        let user_context = bias.0.as_ptr().cast::<c_void>();
+        let _ = self.propagator.set(Some(bias));
+        unsafe {
+            Z3_solver_propagate_init(
+                z3_ctx,
+                self.z3_slv,
+                user_context,
+                Some(push),
+                Some(pop),
+                Some(fresh),
+            );
+            Z3_solver_propagate_decide(z3_ctx, self.z3_slv, Some(decide));
+            for (atom, _) in atoms {
+                Z3_solver_propagate_register(z3_ctx, self.z3_slv, atom.z3_ast);
+            }
+        }
     }
 
     /// Assert a constraint `a` into the solver, and track it (in the
@@ -629,12 +763,18 @@ impl Clone for Solver {
 
 unsafe impl Translate for Solver {
     fn translate(&self, dest: &Context) -> Solver {
-        unsafe {
+        let solver = unsafe {
             Solver::wrap(
                 dest,
                 Z3_solver_translate(self.ctx.z3_ctx.0, self.z3_slv, dest.z3_ctx.0).unwrap(),
             )
+        };
+        // Z3 copies the user propagator too, without a state (see `Solver::set_phase_bias`).
+        #[cfg(feature = "z3_4_16")]
+        if self.propagator.get().is_some() {
+            let _ = solver.propagator.set(None);
         }
+        solver
     }
 }
 

@@ -67,6 +67,28 @@ impl Optimize {
         unsafe { Z3_optimize_assert(self.ctx.z3_ctx.0, self.z3_opt, ast.get_z3_ast()) };
     }
 
+    /// Give the optimizer a hint that `var` should take `value`. For a Boolean `var`, this sets
+    /// its initial phase. It is a heuristic only: it never changes the result of a check, and
+    /// the objectives take precedence over it.
+    ///
+    /// A Boolean `var` that Z3 never assigns (it does not matter for the assertions) gets no value
+    /// from this hint; its value in the model depends on model completion.
+    ///
+    /// `var` and `value` must have the same sort.
+    // Behind the `z3_4_16` feature: the Z3 function it uses is newer than the minimum
+    // supported Z3 version.
+    #[cfg(feature = "z3_4_16")]
+    pub fn set_initial_value<T: Ast>(&self, var: &T, value: &T) {
+        unsafe {
+            Z3_optimize_set_initial_value(
+                self.ctx.z3_ctx.0,
+                self.z3_opt,
+                var.get_z3_ast(),
+                value.get_z3_ast(),
+            )
+        };
+    }
+
     /// Assert a constraint `a` into the solver, and track it (in the
     /// unsat) core using the Boolean constant `p`.
     ///

@@ -180,6 +180,10 @@ pub struct IsNotApp {
 pub struct Solver {
     ctx: Context,
     z3_slv: Z3_solver,
+    // Set once Z3's solver has a user propagator (see `Solver::set_phase_bias`): its state, or
+    // `None` for a copy made by `translate` (Z3 copies the propagator without a state).
+    #[cfg(feature = "z3_4_16")]
+    propagator: std::cell::OnceCell<Option<solver::OwnedPhaseBias>>,
 }
 
 /// Model for the constraints inserted into the logical context.
